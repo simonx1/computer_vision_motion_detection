@@ -1,0 +1,528 @@
+#!/usr/bin/env python3
+"""
+Motion Detection CLI Application
+Monitors RTSP camera stream for movement and records clips when detected.
+Uses YOLO object tracking (ByteTrack) for motion detection.
+"""
+
+import argparse
+import cv2
+import numpy as np
+from datetime import datetime
+from pathlib import Path
+import os
+import platform
+import logging
+from logging.handlers import TimedRotatingFileHandler
+from dotenv import load_dotenv
+from ultralytics import YOLO
+
+# Load environment variables from .env file
+load_dotenv()
+
+
+class MotionDetector:
+    def __init__(self, rtsp_url, model_size='s', min_confidence=0.30,
+                 motion_threshold=75, sustained_frames=3,
+                 output_dir="recordings", display=True):
+        """
+        Initialize the motion detector with YOLO tracking.
+
+        Args:
+            rtsp_url: RTSP stream URL
+            model_size: YOLO model size ('n', 's', 'm', 'l', 'x')
+            min_confidence: Minimum confidence threshold for detections
+            motion_threshold: Minimum pixels movement over sustained_frames to trigger
+            sustained_frames: Number of frames to check for sustained movement
+            output_dir: Directory to save recordings
+            display: Show live video feed
+        """
+        self.rtsp_url = rtsp_url
+        self.model_size = model_size
+        self.min_confidence = min_confidence
+        self.motion_threshold_param = motion_threshold
+        self.sustained_motion_frames_param = sustained_frames
+        self.output_dir = Path(output_dir)
+        self.display = display
+
+        # Create output directory
+        self.output_dir.mkdir(exist_ok=True)
+
+        # Setup logging
+        self.setup_logging()
+
+        # Initialize video capture
+        self.cap = None
+        self.recording = False
+        self.video_writer = None
+        self.motion_start_time = None
+
+        # Object tracking: track positions of detected objects
+        self.tracked_objects = {}  # {track_id: {'positions': [bbox, ...], 'class': str, 'last_seen': frame_num}}
+        self.frame_count = 0
+        self.motion_threshold = self.motion_threshold_param
+        self.sustained_motion_frames = self.sustained_motion_frames_param
+        self.frames_without_motion = 0
+        self.motion_cooldown = 60  # Frames to wait before stopping recording (3s at 20fps)
+
+        # Live object classes (animals and humans only)
+        self.live_object_classes = {
+            'person', 'cat', 'dog', 'horse', 'sheep', 'cow', 'elephant',
+            'bear', 'zebra', 'giraffe', 'bird'
+        }
+
+        print(f"Live object classes: {', '.join(sorted(self.live_object_classes))}")
+
+        # Initialize YOLO model with tracking
+        print(f"Loading YOLOv8-{model_size} model...")
+        try:
+            self.model = YOLO(f'yolov8{model_size}.pt')
+            print(f"YOLOv8-{model_size} model loaded successfully")
+            print(f"Minimum confidence: {min_confidence} (filters low-confidence false positives)")
+            print(f"Motion threshold: {self.motion_threshold} pixels over {self.sustained_motion_frames} frames")
+        except Exception as e:
+            raise RuntimeError(f"Could not load YOLO model: {e}")
+
+    def setup_logging(self):
+        """Setup logging with daily rotation"""
+        # Create logs directory
+        logs_dir = Path("logs")
+        logs_dir.mkdir(exist_ok=True)
+
+        # Create logger
+        self.logger = logging.getLogger('MotionDetector')
+        self.logger.setLevel(logging.INFO)
+
+        # Remove existing handlers
+        self.logger.handlers.clear()
+
+        # Daily rotating file handler
+        log_file = logs_dir / "motion_events.log"
+        file_handler = TimedRotatingFileHandler(
+            log_file,
+            when='midnight',
+            interval=1,
+            backupCount=30,  # Keep 30 days of logs
+            encoding='utf-8'
+        )
+        file_handler.suffix = "%Y%m%d"  # Add date suffix to rotated logs
+
+        # Formatter
+        formatter = logging.Formatter(
+            '%(asctime)s | %(levelname)s | %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        file_handler.setFormatter(formatter)
+
+        # Add handler
+        self.logger.addHandler(file_handler)
+
+        # Log startup
+        self.logger.info("="*60)
+        self.logger.info("Motion Detector Started (YOLO Tracking)")
+        self.logger.info(f"Model: YOLOv8-{self.model_size}")
+        self.logger.info(f"Min Confidence: {self.min_confidence}")
+        self.logger.info("="*60)
+
+    def play_alert(self):
+        """Play alert sound - uses Mac system sound"""
+        print("🔔 Alert!")
+        if platform.system() == 'Darwin':  # macOS
+            # Use afplay with system sound - play in background
+            os.system('afplay /System/Library/Sounds/Glass.aiff &')
+        else:
+            # Fallback for other systems - terminal bell
+            print('\a', flush=True)
+
+    def connect_stream(self):
+        """Connect to RTSP stream"""
+        print(f"Connecting to RTSP stream: {self.rtsp_url}")
+        self.cap = cv2.VideoCapture(self.rtsp_url)
+
+        if not self.cap.isOpened():
+            raise ConnectionError(f"Failed to connect to RTSP stream: {self.rtsp_url}")
+
+        # Set buffer size to reduce latency
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        print("Successfully connected to stream")
+        print(f"Frame size: {int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
+        print(f"FPS: {self.cap.get(cv2.CAP_PROP_FPS)}")
+
+    def detect_motion_and_classify(self, frame):
+        """
+        Run YOLO tracking on frame and detect motion via position changes.
+
+        Returns:
+            tuple: (has_motion, live_objects_list)
+        """
+        self.frame_count += 1
+
+        # Run YOLO tracking with enhanced image for nighttime
+        # Apply CLAHE for better low-light detection
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        l_enhanced = clahe.apply(l)
+        lab_enhanced = cv2.merge([l_enhanced, a, b])
+        enhanced_frame = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
+
+        # Track objects across frames
+        results = self.model.track(
+            enhanced_frame,
+            conf=self.min_confidence,
+            persist=True,  # Keep track IDs across frames
+            verbose=False,
+            tracker='bytetrack.yaml'  # Use ByteTrack algorithm
+        )
+
+        live_objects = []
+        has_motion = False
+
+        if results and len(results) > 0:
+            boxes = results[0].boxes
+
+            if boxes and boxes.id is not None:
+                for box in boxes:
+                    # Get detection info
+                    track_id = int(box.id[0])
+                    class_id = int(box.cls[0])
+                    confidence = float(box.conf[0])
+                    class_name = self.model.names[class_id]
+                    bbox = box.xyxy[0].cpu().numpy()
+
+                    # Only track live objects
+                    if class_name not in self.live_object_classes:
+                        continue
+
+                    # Calculate bbox center
+                    center_x = (bbox[0] + bbox[2]) / 2
+                    center_y = (bbox[1] + bbox[3]) / 2
+                    current_center = (center_x, center_y)
+
+                    # Check if object moved with sustained motion requirement
+                    if track_id in self.tracked_objects:
+                        # Object was seen before - check sustained movement
+                        prev_positions = self.tracked_objects[track_id]['positions']
+
+                        # Update position history first
+                        self.tracked_objects[track_id]['positions'].append(current_center)
+                        if len(self.tracked_objects[track_id]['positions']) > 10:
+                            self.tracked_objects[track_id]['positions'].pop(0)
+                        self.tracked_objects[track_id]['last_seen'] = self.frame_count
+
+                        # Check if object has moved significantly over last N frames
+                        if len(self.tracked_objects[track_id]['positions']) >= self.sustained_motion_frames:
+                            # Compare current position to position N frames ago
+                            old_position = self.tracked_objects[track_id]['positions'][-(self.sustained_motion_frames)]
+                            total_distance = np.sqrt(
+                                (current_center[0] - old_position[0]) ** 2 +
+                                (current_center[1] - old_position[1]) ** 2
+                            )
+
+                            # Require sustained movement over multiple frames
+                            if total_distance > self.motion_threshold:
+                                has_motion = True
+                    else:
+                        # New object detected - don't trigger immediately
+                        # Wait for sustained movement to avoid jitter on first detection
+                        self.tracked_objects[track_id] = {
+                            'positions': [current_center],
+                            'class': class_name,
+                            'last_seen': self.frame_count
+                        }
+
+                    # Add to live objects list
+                    obj_width = int(bbox[2] - bbox[0])
+                    obj_height = int(bbox[3] - bbox[1])
+                    live_objects.append({
+                        'track_id': track_id,
+                        'class': class_name,
+                        'confidence': confidence,
+                        'bbox': bbox,
+                        'size': (obj_width, obj_height),
+                        'area': obj_width * obj_height
+                    })
+
+        # Clean up old tracks (not seen for 30 frames)
+        tracks_to_remove = []
+        for track_id, data in self.tracked_objects.items():
+            if self.frame_count - data['last_seen'] > 30:
+                tracks_to_remove.append(track_id)
+        for track_id in tracks_to_remove:
+            del self.tracked_objects[track_id]
+
+        return has_motion, live_objects
+
+    def start_recording(self, frame):
+        """Start recording video"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = self.output_dir / f"motion_{timestamp}.mp4"
+
+        # Use H.264 codec for QuickTime compatibility
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        fps = self.cap.get(cv2.CAP_PROP_FPS) or 20.0
+        frame_size = (frame.shape[1], frame.shape[0])
+
+        self.video_writer = cv2.VideoWriter(str(filename), fourcc, fps, frame_size)
+        self.recording = True
+        self.motion_start_time = datetime.now()
+
+        print(f"\n{'='*60}")
+        print(f"🔴 RECORDING STARTED: {filename.name}")
+        print(f"{'='*60}")
+
+        # Log recording start
+        self.logger.info(f"RECORDING STARTED: {filename.name}")
+
+    def stop_recording(self):
+        """Stop recording video"""
+        if self.video_writer:
+            self.video_writer.release()
+            self.video_writer = None
+
+        if self.recording:
+            duration = (datetime.now() - self.motion_start_time).total_seconds()
+            print(f"{'='*60}")
+            print(f"⏹️  RECORDING STOPPED (Duration: {duration:.1f}s)")
+            print(f"{'='*60}\n")
+
+            # Log recording stop
+            self.logger.info(f"RECORDING STOPPED | Duration: {duration:.1f}s")
+
+        self.recording = False
+        self.motion_start_time = None
+
+    def draw_detections(self, frame, objects):
+        """Draw detection boxes and labels on frame"""
+        display_frame = frame.copy()
+
+        # Draw YOLO tracked objects
+        for obj in objects:
+            bbox = obj['bbox']
+            x1, y1, x2, y2 = map(int, bbox)
+            label = f"{obj['class']}: {obj['confidence']:.0%} (ID:{obj['track_id']})"
+
+            # Draw box (green)
+            cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+            # Draw label background
+            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+            cv2.rectangle(display_frame, (x1, y1 - label_size[1] - 10),
+                         (x1 + label_size[0], y1), (0, 255, 0), -1)
+
+            # Draw label text
+            cv2.putText(display_frame, label, (x1, y1 - 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+        # Add recording indicator
+        if self.recording:
+            cv2.circle(display_frame, (30, 30), 10, (0, 0, 255), -1)
+            cv2.putText(display_frame, "REC", (50, 35),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        # Add timestamp
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cv2.putText(display_frame, timestamp, (10, frame.shape[0] - 10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        return display_frame
+
+    def run(self):
+        """Main detection loop"""
+        try:
+            self.connect_stream()
+
+            print("\n" + "="*60)
+            print("Motion Detection Active (YOLO Tracking)")
+            print(f"Model: YOLOv8-{self.model_size}")
+            print(f"Min Confidence: {self.min_confidence}")
+            print(f"Motion Threshold: {self.motion_threshold} pixels")
+            print("Press 'q' to quit")
+            print("="*60 + "\n")
+
+            while True:
+                ret, frame = self.cap.read()
+
+                if not ret:
+                    print("Failed to read frame, attempting to reconnect...")
+                    self.cap.release()
+                    self.connect_stream()
+                    continue
+
+                # Detect motion and classify objects
+                has_motion, live_objects = self.detect_motion_and_classify(frame)
+
+                if has_motion and len(live_objects) > 0:
+                    self.frames_without_motion = 0
+
+                    # Start recording if not already recording
+                    if not self.recording:
+                        self.play_alert()
+                        self.start_recording(frame)
+
+                        # Print detection info
+                        print(f"⚠️  LIVE OBJECT DETECTED!")
+                        print(f"   Objects: {len(live_objects)}")
+
+                        # Log motion detection
+                        objects_str = ", ".join([
+                            f"{obj['class']}({obj['confidence']:.0%})"
+                            for obj in live_objects[:3]  # Log top 3
+                        ])
+                        self.logger.info(f"MOTION DETECTED | Objects: {objects_str}")
+
+                        print(f"   🐾 LIVE OBJECTS IDENTIFIED:")
+                        for i, obj in enumerate(live_objects[:5], 1):  # Show top 5
+                            width, height = obj['size']
+                            confidence_indicator = "✓✓✓" if obj['confidence'] > 0.7 else "✓✓" if obj['confidence'] > 0.4 else "✓"
+                            print(f"   {i}. {obj['class'].upper()} {confidence_indicator}")
+                            print(f"      Confidence: {obj['confidence']:.1%} | Size: {width}x{height}px | ID: {obj['track_id']}")
+
+                    # Record frame
+                    if self.recording and self.video_writer:
+                        self.video_writer.write(frame)
+                else:
+                    # No motion detected
+                    self.frames_without_motion += 1
+
+                    # Continue recording for cooldown period
+                    if self.recording:
+                        if self.frames_without_motion < self.motion_cooldown:
+                            if self.video_writer:
+                                self.video_writer.write(frame)
+                        else:
+                            self.stop_recording()
+
+                # Display frame
+                if self.display:
+                    display_frame = self.draw_detections(frame, live_objects if has_motion else [])
+
+                    # Resize display window to 33% for smaller preview
+                    display_height, display_width = display_frame.shape[:2]
+                    display_frame_resized = cv2.resize(display_frame,
+                                                       (display_width // 3, display_height // 3),
+                                                       interpolation=cv2.INTER_LINEAR)
+
+                    cv2.imshow('Motion Detector', display_frame_resized)
+
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        print("\nShutting down...")
+                        break
+
+        except KeyboardInterrupt:
+            print("\n\nShutting down...")
+        except Exception as e:
+            print(f"\nError: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self.cleanup()
+
+    def cleanup(self):
+        """Clean up resources"""
+        if self.recording:
+            self.stop_recording()
+
+        if self.cap:
+            self.cap.release()
+
+        cv2.destroyAllWindows()
+
+        # Log shutdown
+        self.logger.info("Motion Detector Stopped")
+        self.logger.info("="*60)
+
+        print("Cleanup complete")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Motion Detection CLI for RTSP Camera Streams (YOLO Tracking)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic usage with default settings (YOLOv8-small)
+  python motion_detector.py
+
+  # Use larger model for better accuracy
+  python motion_detector.py --model m
+
+  # Use nano model for lower CPU usage
+  python motion_detector.py --model n
+
+  # Adjust confidence threshold
+  python motion_detector.py --confidence 0.20
+        """
+    )
+
+    parser.add_argument(
+        '--url',
+        type=str,
+        default=os.getenv('RTSP_URL', 'rtsp://admin:password@192.168.1.108'),
+        help='RTSP stream URL (default: from .env file)'
+    )
+
+    parser.add_argument(
+        '--model',
+        type=str,
+        default='s',
+        choices=['n', 's', 'm', 'l', 'x'],
+        help='YOLO model size: n=nano, s=small, m=medium, l=large, x=xlarge (default: s)'
+    )
+
+    parser.add_argument(
+        '--confidence',
+        type=float,
+        default=0.30,
+        help='Minimum confidence threshold (0.0-1.0, default: 0.30). '
+             'Higher = fewer false positives from plants/shadows. '
+             'Recommended: 0.25-0.40'
+    )
+
+    parser.add_argument(
+        '--motion-threshold',
+        type=int,
+        default=75,
+        help='Minimum pixel movement to trigger recording (default: 75). '
+             'Lower = more sensitive to movement. Prevents false triggers from bounding box jitter.'
+    )
+
+    parser.add_argument(
+        '--sustained-frames',
+        type=int,
+        default=3,
+        help='Number of frames to check for sustained movement (default: 3). '
+             'Requires consistent movement over multiple frames to filter jitter.'
+    )
+
+    parser.add_argument(
+        '--output-dir',
+        type=str,
+        default='recordings',
+        help='Directory to save recordings (default: recordings)'
+    )
+
+    parser.add_argument(
+        '--no-display',
+        action='store_true',
+        help='Disable live video display (headless mode)'
+    )
+
+    args = parser.parse_args()
+
+    detector = MotionDetector(
+        rtsp_url=args.url,
+        model_size=args.model,
+        min_confidence=args.confidence,
+        motion_threshold=args.motion_threshold,
+        sustained_frames=args.sustained_frames,
+        output_dir=args.output_dir,
+        display=not args.no_display
+    )
+
+    detector.run()
+
+
+if __name__ == '__main__':
+    main()
