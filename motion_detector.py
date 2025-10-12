@@ -172,21 +172,31 @@ class MotionDetector:
         """Connect to RTSP stream with optimized settings"""
         print(f"Connecting to RTSP stream: {self.rtsp_url}")
 
-        # Use RTSP over TCP (more reliable than UDP, reduces packet loss)
-        # Set backend to ffmpeg for better RTSP handling
+        # Get RTSP transport and buffer size from environment
+        rtsp_transport = os.getenv('RTSP_TRANSPORT', 'tcp').lower()
+        buffer_size = int(os.getenv('BUFFER_SIZE', '5'))
+
+        # Set RTSP transport protocol (tcp = reliable, udp = low latency)
+        # TCP prevents UDP packet loss which causes HEVC "Could not find ref" errors
+        os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = f'rtsp_transport;{rtsp_transport}'
+
+        # Use FFmpeg backend for better RTSP handling
         self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
 
-        # Configure RTSP to use TCP transport (more reliable)
-        self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000)  # 3 second timeout
-        self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 3000)
+        # Configure RTSP timeouts
+        self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)  # 5 second connection timeout
+        self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)  # 5 second read timeout
 
         if not self.cap.isOpened():
             raise ConnectionError(f"Failed to connect to RTSP stream: {self.rtsp_url}")
 
-        # Set buffer size to reduce latency but keep some buffering
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)  # Small buffer to handle jitter
+        # Set buffer size to balance latency vs reliability
+        # Larger buffer = fewer dropped frames (less HEVC errors) but more latency
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, buffer_size)
 
         print("Successfully connected to stream")
+        print(f"Transport: {rtsp_transport.upper()}")
+        print(f"Buffer size: {buffer_size} frames")
         print(f"Frame size: {int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
         print(f"FPS: {self.cap.get(cv2.CAP_PROP_FPS)}")
 
