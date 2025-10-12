@@ -63,9 +63,14 @@ class MotionDetector:
         # Initialize video capture
         self.cap = None
         self.recording = False
+        self.manual_recording = False  # Manual recording mode (space bar)
         self.video_writer = None
         self.motion_start_time = None
         self.current_filename = None  # Track current recording filename
+
+        # Create screenshots directory
+        self.screenshots_dir = Path("screenshots")
+        self.screenshots_dir.mkdir(exist_ok=True)
 
         # Object tracking: track positions of detected objects
         self.tracked_objects = {}  # {track_id: {'positions': [bbox, ...], 'class': str, 'last_seen': frame_num}}
@@ -493,10 +498,11 @@ class MotionDetector:
 
         return has_motion, live_objects
 
-    def start_recording(self, frame):
+    def start_recording(self, frame, manual=False):
         """Start recording video"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = self.output_dir / f"motion_{timestamp}.mp4"
+        prefix = "manual" if manual else "motion"
+        filename = self.output_dir / f"{prefix}_{timestamp}.mp4"
 
         # Use H.264 codec for QuickTime compatibility
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -505,15 +511,22 @@ class MotionDetector:
 
         self.video_writer = cv2.VideoWriter(str(filename), fourcc, fps, frame_size)
         self.recording = True
+        self.manual_recording = manual
         self.motion_start_time = datetime.now()
         self.current_filename = filename.name  # Store current filename
 
         print(f"\n{'='*60}")
-        print(f"🔴 RECORDING STARTED: {filename.name}")
+        if manual:
+            print(f"🔴 MANUAL RECORDING STARTED: {filename.name}")
+        else:
+            print(f"🔴 RECORDING STARTED: {filename.name}")
         print(f"{'='*60}")
 
         # Log recording start
-        self.logger.info(f"RECORDING STARTED: {filename.name}")
+        if manual:
+            self.logger.info(f"MANUAL RECORDING STARTED: {filename.name}")
+        else:
+            self.logger.info(f"RECORDING STARTED: {filename.name}")
 
     def stop_recording(self):
         """Stop recording video"""
@@ -524,7 +537,10 @@ class MotionDetector:
         if self.recording:
             duration = (datetime.now() - self.motion_start_time).total_seconds()
             print(f"{'='*60}")
-            print(f"⏹️  RECORDING STOPPED (Duration: {duration:.1f}s)")
+            if self.manual_recording:
+                print(f"⏹️  MANUAL RECORDING STOPPED (Duration: {duration:.1f}s)")
+            else:
+                print(f"⏹️  RECORDING STOPPED (Duration: {duration:.1f}s)")
             print(f"{'='*60}\n")
 
             # Log recording stop with filename
@@ -534,8 +550,20 @@ class MotionDetector:
                 self.logger.info(f"RECORDING STOPPED | Duration: {duration:.1f}s")
 
         self.recording = False
+        self.manual_recording = False
         self.motion_start_time = None
         self.current_filename = None
+
+    def save_screenshot(self, frame):
+        """Save a screenshot of the current frame"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = self.screenshots_dir / f"screenshot_{timestamp}.jpg"
+
+        # Save as JPEG with high quality
+        cv2.imwrite(str(filename), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+        print(f"\n📸 Screenshot saved: {filename.name}")
+        self.logger.info(f"SCREENSHOT SAVED: {filename.name}")
 
     def draw_detections(self, frame, objects):
         """Draw detection boxes and labels on frame"""
@@ -561,9 +589,14 @@ class MotionDetector:
 
         # Add recording indicator
         if self.recording:
-            cv2.circle(display_frame, (30, 30), 10, (0, 0, 255), -1)
-            cv2.putText(display_frame, "REC", (50, 35),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            if self.manual_recording:
+                cv2.circle(display_frame, (30, 30), 10, (255, 0, 0), -1)  # Blue for manual
+                cv2.putText(display_frame, "MANUAL REC", (50, 35),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+            else:
+                cv2.circle(display_frame, (30, 30), 10, (0, 0, 255), -1)  # Red for motion
+                cv2.putText(display_frame, "REC", (50, 35),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
         # Add timestamp
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -582,7 +615,11 @@ class MotionDetector:
             print(f"Model: YOLOv8-{self.model_size}")
             print(f"Min Confidence: {self.min_confidence}")
             print(f"Motion Threshold: {self.motion_threshold} pixels")
-            print("Press 'q' to quit")
+            print()
+            print("Keyboard Controls:")
+            print("  SPACE - Start/Stop manual recording")
+            print("  ENTER - Take screenshot")
+            print("  Q     - Quit")
             print("="*60 + "\n")
 
             while True:
@@ -619,13 +656,14 @@ class MotionDetector:
                 # Detect motion and classify objects
                 has_motion, live_objects = self.detect_motion_and_classify(frame)
 
-                if has_motion and len(live_objects) > 0:
+                # Motion detection should only trigger recordings if not in manual recording mode
+                if has_motion and len(live_objects) > 0 and not self.manual_recording:
                     self.frames_without_motion = 0
 
                     # Start recording if not already recording
                     if not self.recording:
                         self.play_alert()
-                        self.start_recording(frame)
+                        self.start_recording(frame, manual=False)
 
                         # Print detection info
                         print(f"⚠️  LIVE OBJECT DETECTED!")
@@ -660,13 +698,17 @@ class MotionDetector:
                     # No motion detected
                     self.frames_without_motion += 1
 
-                    # Continue recording for cooldown period
-                    if self.recording:
+                    # Continue recording for cooldown period (only for automatic recordings)
+                    if self.recording and not self.manual_recording:
                         if self.frames_without_motion < self.motion_cooldown:
                             if self.video_writer:
                                 self.video_writer.write(frame)
                         else:
                             self.stop_recording()
+
+                # Always record if in manual recording mode
+                if self.manual_recording and self.recording and self.video_writer:
+                    self.video_writer.write(frame)
 
                 # Display frame
                 if self.display:
@@ -680,9 +722,29 @@ class MotionDetector:
 
                     cv2.imshow('Motion Detector', display_frame_resized)
 
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                    # Handle keyboard input
+                    key = cv2.waitKey(1) & 0xFF
+
+                    # Q - Quit
+                    if key == ord('q'):
                         print("\nShutting down...")
                         break
+
+                    # Space - Toggle manual recording
+                    elif key == ord(' '):
+                        if self.manual_recording:
+                            # Stop manual recording
+                            self.stop_recording()
+                        else:
+                            # Start manual recording
+                            if self.recording:
+                                # Stop current recording first
+                                self.stop_recording()
+                            self.start_recording(frame, manual=True)
+
+                    # Enter - Take screenshot
+                    elif key == 13 or key == 10:  # Enter key (13 on Windows, 10 on Linux/Mac)
+                        self.save_screenshot(frame)
 
         except KeyboardInterrupt:
             print("\n\nShutting down...")
