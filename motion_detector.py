@@ -75,6 +75,11 @@ class MotionDetector:
         self.frames_without_motion = 0
         self.motion_cooldown = 60  # Frames to wait before stopping recording (3s at 20fps)
 
+        # Frame validation for corrupted stream handling
+        self.expected_frame_size = None
+        self.corrupted_frames_count = 0
+        self.max_consecutive_corrupted = 10  # Reconnect after 10 consecutive bad frames
+
         # Fallback motion detection (background subtraction + optical flow)
         self.bg_subtractor = None
         self.prev_frame_gray = None  # For optical flow
@@ -164,15 +169,22 @@ class MotionDetector:
             print('\a', flush=True)
 
     def connect_stream(self):
-        """Connect to RTSP stream"""
+        """Connect to RTSP stream with optimized settings"""
         print(f"Connecting to RTSP stream: {self.rtsp_url}")
-        self.cap = cv2.VideoCapture(self.rtsp_url)
+
+        # Use RTSP over TCP (more reliable than UDP, reduces packet loss)
+        # Set backend to ffmpeg for better RTSP handling
+        self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+
+        # Configure RTSP to use TCP transport (more reliable)
+        self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000)  # 3 second timeout
+        self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 3000)
 
         if not self.cap.isOpened():
             raise ConnectionError(f"Failed to connect to RTSP stream: {self.rtsp_url}")
 
-        # Set buffer size to reduce latency
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Set buffer size to reduce latency but keep some buffering
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)  # Small buffer to handle jitter
 
         print("Successfully connected to stream")
         print(f"Frame size: {int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
@@ -203,6 +215,53 @@ class MotionDetector:
             cv2.rectangle(mask, (x1, y1), (x2, y2), 0, -1)
 
         return mask
+
+    def is_frame_valid(self, frame):
+        """
+        Validate frame to detect corruption from RTSP/HEVC errors
+
+        Returns:
+            bool: True if frame is valid, False if corrupted
+        """
+        # Check 1: Frame exists and is not None
+        if frame is None:
+            return False
+
+        # Check 2: Frame has valid shape
+        if len(frame.shape) != 3:
+            return False
+
+        height, width, channels = frame.shape
+
+        # Check 3: Frame dimensions are reasonable
+        if height < 100 or width < 100 or channels != 3:
+            return False
+
+        # Check 4: Store expected size on first valid frame
+        if self.expected_frame_size is None:
+            self.expected_frame_size = (height, width)
+            print(f"Expected frame size set to: {width}x{height}px")
+            return True
+
+        # Check 5: Frame size matches expected (catches decoder issues)
+        if (height, width) != self.expected_frame_size:
+            return False
+
+        # Check 6: Check for excessive corruption (gray/black frames)
+        # Calculate mean pixel intensity - corrupted frames are often uniform gray
+        mean_intensity = np.mean(frame)
+        std_intensity = np.std(frame)
+
+        # Valid frames have variation (std > 10)
+        # Corrupted frames are often uniform gray (std < 5)
+        if std_intensity < 5.0:
+            return False
+
+        # Check 7: Look for HEVC artifacts - entire frame very dark or very bright
+        if mean_intensity < 10 or mean_intensity > 245:
+            return False
+
+        return True
 
     def detect_motion_and_classify(self, frame):
         """
@@ -524,6 +583,28 @@ class MotionDetector:
                     self.cap.release()
                     self.connect_stream()
                     continue
+
+                # Validate frame to filter out RTSP/HEVC corruption
+                if not self.is_frame_valid(frame):
+                    self.corrupted_frames_count += 1
+
+                    if self.corrupted_frames_count == 1:
+                        print(f"⚠️  Corrupted frame detected (HEVC/RTSP error) - skipping")
+
+                    # Too many consecutive corrupted frames - reconnect
+                    if self.corrupted_frames_count >= self.max_consecutive_corrupted:
+                        print(f"⚠️  Too many corrupted frames ({self.corrupted_frames_count}), reconnecting...")
+                        self.cap.release()
+                        self.connect_stream()
+                        self.corrupted_frames_count = 0
+                        self.expected_frame_size = None  # Reset frame size
+                    continue
+
+                # Frame is valid - reset corruption counter
+                if self.corrupted_frames_count > 0:
+                    if self.corrupted_frames_count > 1:
+                        print(f"✓ Stream recovered (skipped {self.corrupted_frames_count} corrupted frames)")
+                    self.corrupted_frames_count = 0
 
                 # Detect motion and classify objects
                 has_motion, live_objects = self.detect_motion_and_classify(frame)
