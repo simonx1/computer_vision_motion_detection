@@ -61,3 +61,4 @@ MOTION_DETECTION_OPTIONS.md
 sample/
 test_sample_video.py
 
+.claude/

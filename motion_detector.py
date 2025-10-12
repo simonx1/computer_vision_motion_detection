@@ -24,7 +24,9 @@ load_dotenv()
 class MotionDetector:
     def __init__(self, rtsp_url, model_size='s', min_confidence=0.30,
                  motion_threshold=75, sustained_frames=3,
-                 output_dir="recordings", display=True):
+                 output_dir="recordings", display=True,
+                 enable_fallback=True, fallback_threshold=300,
+                 ignore_regions=None):
         """
         Initialize the motion detector with YOLO tracking.
 
@@ -36,6 +38,9 @@ class MotionDetector:
             sustained_frames: Number of frames to check for sustained movement
             output_dir: Directory to save recordings
             display: Show live video feed
+            enable_fallback: Enable fallback motion detection when YOLO fails
+            fallback_threshold: Minimum pixel area for fallback motion detection
+            ignore_regions: List of regions to ignore for motion detection (x1,y1,x2,y2)
         """
         self.rtsp_url = rtsp_url
         self.model_size = model_size
@@ -44,6 +49,10 @@ class MotionDetector:
         self.sustained_motion_frames_param = sustained_frames
         self.output_dir = Path(output_dir)
         self.display = display
+        self.enable_fallback = enable_fallback
+        self.fallback_threshold = fallback_threshold
+        self.ignore_regions = ignore_regions or []
+        self.ignore_mask = None  # Will be created when we get first frame
 
         # Create output directory
         self.output_dir.mkdir(exist_ok=True)
@@ -56,6 +65,7 @@ class MotionDetector:
         self.recording = False
         self.video_writer = None
         self.motion_start_time = None
+        self.current_filename = None  # Track current recording filename
 
         # Object tracking: track positions of detected objects
         self.tracked_objects = {}  # {track_id: {'positions': [bbox, ...], 'class': str, 'last_seen': frame_num}}
@@ -64,6 +74,21 @@ class MotionDetector:
         self.sustained_motion_frames = self.sustained_motion_frames_param
         self.frames_without_motion = 0
         self.motion_cooldown = 60  # Frames to wait before stopping recording (3s at 20fps)
+
+        # Fallback motion detection (background subtraction + optical flow)
+        self.bg_subtractor = None
+        self.prev_frame_gray = None  # For optical flow
+        self.fallback_motion_frames = 0  # Track consecutive frames with fallback motion
+        self.fallback_sustained_frames = 4  # Require 4 frames of motion before triggering
+        self.fallback_motion_areas = []  # Track motion area sizes for consistency check
+        self.bg_learning_frames = 50  # Skip fallback for first 50 frames (bg subtractor learning)
+
+        if self.enable_fallback:
+            self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
+                history=500,
+                varThreshold=35,  # Further increased to reduce sensitivity
+                detectShadows=False
+            )
 
         # Live object classes (animals and humans only)
         self.live_object_classes = {
@@ -80,6 +105,8 @@ class MotionDetector:
             print(f"YOLOv8-{model_size} model loaded successfully")
             print(f"Minimum confidence: {min_confidence} (filters low-confidence false positives)")
             print(f"Motion threshold: {self.motion_threshold} pixels over {self.sustained_motion_frames} frames")
+            if self.enable_fallback:
+                print(f"Fallback Detection: Enabled (threshold: {fallback_threshold} pixels)")
         except Exception as e:
             raise RuntimeError(f"Could not load YOLO model: {e}")
 
@@ -122,6 +149,8 @@ class MotionDetector:
         self.logger.info("Motion Detector Started (YOLO Tracking)")
         self.logger.info(f"Model: YOLOv8-{self.model_size}")
         self.logger.info(f"Min Confidence: {self.min_confidence}")
+        if self.enable_fallback:
+            self.logger.info(f"Fallback Detection: Enabled")
         self.logger.info("="*60)
 
     def play_alert(self):
@@ -149,6 +178,32 @@ class MotionDetector:
         print(f"Frame size: {int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
         print(f"FPS: {self.cap.get(cv2.CAP_PROP_FPS)}")
 
+    def create_ignore_mask(self, frame_shape):
+        """Create a mask for ignore regions (e.g., timestamp areas)"""
+        height, width = frame_shape[:2]
+        mask = np.ones((height, width), dtype=np.uint8) * 255  # Start with all white (include everything)
+
+        for region in self.ignore_regions:
+            x1, y1, x2, y2 = region
+
+            # Convert percentages to pixels if needed (values between 0 and 1)
+            if 0 < x1 < 1:
+                x1 = int(x1 * width)
+            if 0 < y1 < 1:
+                y1 = int(y1 * height)
+            if 0 < x2 < 1:
+                x2 = int(x2 * width)
+            if 0 < y2 < 1:
+                y2 = int(y2 * height)
+
+            # Make sure coordinates are integers
+            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+
+            # Black out the ignore region (set to 0)
+            cv2.rectangle(mask, (x1, y1), (x2, y2), 0, -1)
+
+        return mask
+
     def detect_motion_and_classify(self, frame):
         """
         Run YOLO tracking on frame and detect motion via position changes.
@@ -157,6 +212,11 @@ class MotionDetector:
             tuple: (has_motion, live_objects_list)
         """
         self.frame_count += 1
+
+        # Create ignore mask on first frame
+        if self.ignore_mask is None and len(self.ignore_regions) > 0:
+            self.ignore_mask = self.create_ignore_mask(frame.shape)
+            print(f"Ignore mask created for {len(self.ignore_regions)} region(s)")
 
         # Run YOLO tracking with enhanced image for nighttime
         # Apply CLAHE for better low-light detection
@@ -252,6 +312,116 @@ class MotionDetector:
         for track_id in tracks_to_remove:
             del self.tracked_objects[track_id]
 
+        # Fallback motion detection if YOLO didn't detect anything
+        # Uses background subtraction + optical flow + consistency checks
+        if not has_motion and self.enable_fallback and self.bg_subtractor is not None:
+            # Skip fallback during background subtractor learning period
+            if self.frame_count <= self.bg_learning_frames:
+                return has_motion, live_objects
+
+            # Convert to grayscale for optical flow
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            # Apply background subtraction
+            fg_mask = self.bg_subtractor.apply(frame)
+
+            # Apply ignore mask to remove timestamp/watermark regions
+            if self.ignore_mask is not None:
+                fg_mask = cv2.bitwise_and(fg_mask, self.ignore_mask)
+
+            # Find contours in the foreground mask
+            contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            # Check if any significant motion detected via background subtraction
+            total_area = 0
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area > 100:  # Filter out very small movements
+                    total_area += area
+
+            # Validate motion with multiple checks
+            has_valid_motion = False
+
+            if total_area > self.fallback_threshold:
+                # Check 1: Motion area consistency
+                # Real objects maintain consistent size; noise varies wildly
+                self.fallback_motion_areas.append(total_area)
+                if len(self.fallback_motion_areas) > 10:
+                    self.fallback_motion_areas.pop(0)
+
+                area_consistency = True
+                if len(self.fallback_motion_areas) >= 3:
+                    # Check if areas are consistent (within 3x range)
+                    areas_array = np.array(self.fallback_motion_areas[-3:])
+                    area_ratio = np.max(areas_array) / (np.min(areas_array) + 1)
+                    if area_ratio > 5.0:  # Too much variation = likely noise
+                        area_consistency = False
+
+                # Check 2: Optical flow validation
+                has_real_flow = False
+                if self.prev_frame_gray is not None:
+                    # Downsample frames for faster optical flow (1/4 resolution)
+                    scale = 0.25
+                    small_prev = cv2.resize(self.prev_frame_gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+                    small_gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+
+                    # Calculate dense optical flow on downsampled frames
+                    flow = cv2.calcOpticalFlowFarneback(
+                        small_prev, small_gray, None,
+                        pyr_scale=0.5, levels=2, winsize=10,
+                        iterations=2, poly_n=5, poly_sigma=1.1, flags=0
+                    )
+
+                    # Calculate magnitude of flow
+                    mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+
+                    # Look at 90th percentile flow instead of median (catches actual movement)
+                    percentile_flow = np.percentile(mag, 90) if mag.size > 0 else 0
+
+                    # Real motion has peak flow above noise level
+                    # Slow-moving cats in IR produce flow 0.03-0.05
+                    # Noise/compression artifacts typically < 0.02
+                    if percentile_flow > 0.025:
+                        has_real_flow = True
+
+                # Valid motion requires BOTH consistency AND optical flow
+                if area_consistency and (has_real_flow or self.prev_frame_gray is None):
+                    has_valid_motion = True
+
+            # Increment or reset sustained motion counter
+            if has_valid_motion:
+                self.fallback_motion_frames += 1
+            else:
+                self.fallback_motion_frames = 0
+                self.fallback_motion_areas.clear()  # Reset on false detection
+
+            # Trigger only after sustained motion over multiple frames
+            if self.fallback_motion_frames >= self.fallback_sustained_frames:
+                # Get bounding box of largest contour
+                if len(contours) > 0 and len(live_objects) == 0:
+                    largest_contour = max(contours, key=cv2.contourArea)
+                    x, y, w, h = cv2.boundingRect(largest_contour)
+
+                    # Filter out tiny detections (noise/artifacts)
+                    # Real cats are at least 40x40 pixels minimum
+                    if w >= 40 and h >= 40:
+                        has_motion = True
+                        live_objects.append({
+                            'track_id': -1,  # Special ID for fallback
+                            'class': 'unknown',
+                            'confidence': 1.0,
+                            'bbox': np.array([x, y, x+w, y+h], dtype=np.float32),
+                            'size': (w, h),
+                            'area': w * h
+                        })
+                    else:
+                        # Too small - reset counter to avoid repeated small detections
+                        self.fallback_motion_frames = 0
+                        self.fallback_motion_areas.clear()
+
+            # Store current frame for next iteration
+            self.prev_frame_gray = gray
+
         return has_motion, live_objects
 
     def start_recording(self, frame):
@@ -267,6 +437,7 @@ class MotionDetector:
         self.video_writer = cv2.VideoWriter(str(filename), fourcc, fps, frame_size)
         self.recording = True
         self.motion_start_time = datetime.now()
+        self.current_filename = filename.name  # Store current filename
 
         print(f"\n{'='*60}")
         print(f"🔴 RECORDING STARTED: {filename.name}")
@@ -287,11 +458,15 @@ class MotionDetector:
             print(f"⏹️  RECORDING STOPPED (Duration: {duration:.1f}s)")
             print(f"{'='*60}\n")
 
-            # Log recording stop
-            self.logger.info(f"RECORDING STOPPED | Duration: {duration:.1f}s")
+            # Log recording stop with filename
+            if self.current_filename:
+                self.logger.info(f"RECORDING STOPPED: {self.current_filename} | Duration: {duration:.1f}s")
+            else:
+                self.logger.info(f"RECORDING STOPPED | Duration: {duration:.1f}s")
 
         self.recording = False
         self.motion_start_time = None
+        self.current_filename = None
 
     def draw_detections(self, frame, objects):
         """Draw detection boxes and labels on frame"""
@@ -365,19 +540,27 @@ class MotionDetector:
                         print(f"⚠️  LIVE OBJECT DETECTED!")
                         print(f"   Objects: {len(live_objects)}")
 
-                        # Log motion detection
-                        objects_str = ", ".join([
-                            f"{obj['class']}({obj['confidence']:.0%})"
-                            for obj in live_objects[:3]  # Log top 3
-                        ])
-                        self.logger.info(f"MOTION DETECTED | Objects: {objects_str}")
+                        # Log motion detection with filename
+                        filename_str = f"{self.current_filename} | " if self.current_filename else ""
+                        if any(obj['class'] == 'unknown' for obj in live_objects):
+                            self.logger.info(f"MOTION DETECTED (FALLBACK): {filename_str}Unknown object moving")
+                        else:
+                            objects_str = ", ".join([
+                                f"{obj['class']}({obj['confidence']:.0%})"
+                                for obj in live_objects[:3]  # Log top 3
+                            ])
+                            self.logger.info(f"MOTION DETECTED: {filename_str}Objects: {objects_str}")
 
                         print(f"   🐾 LIVE OBJECTS IDENTIFIED:")
                         for i, obj in enumerate(live_objects[:5], 1):  # Show top 5
                             width, height = obj['size']
-                            confidence_indicator = "✓✓✓" if obj['confidence'] > 0.7 else "✓✓" if obj['confidence'] > 0.4 else "✓"
-                            print(f"   {i}. {obj['class'].upper()} {confidence_indicator}")
-                            print(f"      Confidence: {obj['confidence']:.1%} | Size: {width}x{height}px | ID: {obj['track_id']}")
+                            if obj['class'] == 'unknown':
+                                print(f"   {i}. UNKNOWN OBJECT (detected via fallback motion)")
+                                print(f"      Size: {width}x{height}px")
+                            else:
+                                confidence_indicator = "✓✓✓" if obj['confidence'] > 0.7 else "✓✓" if obj['confidence'] > 0.4 else "✓"
+                                print(f"   {i}. {obj['class'].upper()} {confidence_indicator}")
+                                print(f"      Confidence: {obj['confidence']:.1%} | Size: {width}x{height}px | ID: {obj['track_id']}")
 
                     # Record frame
                     if self.recording and self.video_writer:
@@ -509,7 +692,68 @@ Examples:
         help='Disable live video display (headless mode)'
     )
 
+    parser.add_argument(
+        '--enable-fallback',
+        type=lambda x: x.lower() == 'true',
+        default=os.getenv('ENABLE_FALLBACK', 'true').lower() == 'true',
+        help='Enable fallback motion detection when YOLO fails (default: true)'
+    )
+
+    parser.add_argument(
+        '--fallback-threshold',
+        type=int,
+        default=int(os.getenv('FALLBACK_THRESHOLD', '300')),
+        help='Minimum pixel area for fallback motion detection (default: 300). '
+             'Lower = more sensitive to any movement.'
+    )
+
+    parser.add_argument(
+        '--ignore-region',
+        action='append',
+        dest='ignore_regions',
+        metavar='X1,Y1,X2,Y2',
+        help='Region to ignore for motion detection (e.g., timestamp area). '
+             'Format: x1,y1,x2,y2 in pixels or 0.0-1.0 for percentages. '
+             'Can be specified multiple times. '
+             'Example: --ignore-region 0,0.9,0.3,1.0 (bottom-left 30%% of frame)'
+    )
+
     args = parser.parse_args()
+
+    # Parse ignore regions - check environment first, then CLI args
+    ignore_regions = []
+
+    # Default ignore region for timestamp (bottom-left corner - covers full date/time watermark)
+    default_regions_str = os.getenv('IGNORE_REGIONS', '0,0.85,0.45,1.0')
+
+    # Parse default/env regions first
+    if default_regions_str:
+        for region_str in default_regions_str.split(';'):
+            region_str = region_str.strip()
+            if not region_str:
+                continue
+            try:
+                coords = [float(x.strip()) for x in region_str.split(',')]
+                if len(coords) != 4:
+                    print(f"Warning: Invalid ignore region '{region_str}'. Must have 4 coordinates. Skipping.")
+                    continue
+                ignore_regions.append(tuple(coords))
+                print(f"Default ignore region added: {coords}")
+            except ValueError as e:
+                print(f"Warning: Could not parse ignore region '{region_str}': {e}. Skipping.")
+
+    # Add CLI specified regions (these override/add to defaults)
+    if args.ignore_regions:
+        for region_str in args.ignore_regions:
+            try:
+                coords = [float(x.strip()) for x in region_str.split(',')]
+                if len(coords) != 4:
+                    print(f"Warning: Invalid ignore region '{region_str}'. Must have 4 coordinates. Skipping.")
+                    continue
+                ignore_regions.append(tuple(coords))
+                print(f"CLI ignore region added: {coords}")
+            except ValueError as e:
+                print(f"Warning: Could not parse ignore region '{region_str}': {e}. Skipping.")
 
     detector = MotionDetector(
         rtsp_url=args.url,
@@ -518,7 +762,10 @@ Examples:
         motion_threshold=args.motion_threshold,
         sustained_frames=args.sustained_frames,
         output_dir=args.output_dir,
-        display=not args.no_display
+        display=not args.no_display,
+        enable_fallback=args.enable_fallback,
+        fallback_threshold=args.fallback_threshold,
+        ignore_regions=ignore_regions
     )
 
     detector.run()
