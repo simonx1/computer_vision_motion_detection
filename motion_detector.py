@@ -84,19 +84,22 @@ class MotionDetector:
         self.expected_frame_size = None
         self.corrupted_frames_count = 0
         self.max_consecutive_corrupted = 10  # Reconnect after 10 consecutive bad frames
+        self.frame_size_initialized = False  # Track if we've shown frame size info
 
         # Fallback motion detection (background subtraction + optical flow)
         self.bg_subtractor = None
         self.prev_frame_gray = None  # For optical flow
         self.fallback_motion_frames = 0  # Track consecutive frames with fallback motion
-        self.fallback_sustained_frames = 4  # Require 4 frames of motion before triggering
+        self.fallback_sustained_frames = 5  # Require 5 frames of motion before triggering (increased)
         self.fallback_motion_areas = []  # Track motion area sizes for consistency check
-        self.bg_learning_frames = 50  # Skip fallback for first 50 frames (bg subtractor learning)
+        self.bg_learning_frames = 100  # Skip fallback for first 100 frames (longer bg learning)
+        self.stable_background_mask = None  # Mask of regions that are part of stable background
+        self.background_update_counter = 0  # Counter for background stability tracking
 
         if self.enable_fallback:
             self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-                history=500,
-                varThreshold=35,  # Further increased to reduce sensitivity
+                history=1000,  # Longer history to better adapt to moving plants
+                varThreshold=50,  # Higher threshold to ignore subtle plant motion
                 detectShadows=False
             )
 
@@ -173,9 +176,12 @@ class MotionDetector:
             # Fallback for other systems - terminal bell
             print('\a', flush=True)
 
-    def connect_stream(self):
+    def connect_stream(self, initial=True):
         """Connect to RTSP stream with optimized settings"""
-        print(f"Connecting to RTSP stream: {self.rtsp_url}")
+        if initial:
+            print(f"Connecting to RTSP stream: {self.rtsp_url}")
+        else:
+            self.logger.info("Reconnecting to RTSP stream...")
 
         # Get RTSP transport and buffer size from environment
         rtsp_transport = os.getenv('RTSP_TRANSPORT', 'tcp').lower()
@@ -199,11 +205,14 @@ class MotionDetector:
         # Larger buffer = fewer dropped frames (less HEVC errors) but more latency
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, buffer_size)
 
-        print("Successfully connected to stream")
-        print(f"Transport: {rtsp_transport.upper()}")
-        print(f"Buffer size: {buffer_size} frames")
-        print(f"Frame size: {int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
-        print(f"FPS: {self.cap.get(cv2.CAP_PROP_FPS)}")
+        if initial:
+            print("Successfully connected to stream")
+            print(f"Transport: {rtsp_transport.upper()}")
+            print(f"Buffer size: {buffer_size} frames")
+            print(f"Frame size: {int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
+            print(f"FPS: {self.cap.get(cv2.CAP_PROP_FPS)}")
+        else:
+            self.logger.info(f"Reconnected successfully | Transport: {rtsp_transport.upper()} | Buffer: {buffer_size}")
 
     def create_ignore_mask(self, frame_shape):
         """Create a mask for ignore regions (e.g., timestamp areas)"""
@@ -255,7 +264,11 @@ class MotionDetector:
         # Check 4: Store expected size on first valid frame
         if self.expected_frame_size is None:
             self.expected_frame_size = (height, width)
-            print(f"Expected frame size set to: {width}x{height}px")
+            if not self.frame_size_initialized:
+                print(f"Expected frame size set to: {width}x{height}px")
+                self.frame_size_initialized = True
+            else:
+                self.logger.info(f"Frame size reset after reconnection: {width}x{height}px")
             return True
 
         # Check 5: Frame size matches expected (catches decoder issues)
@@ -386,8 +399,8 @@ class MotionDetector:
         for track_id in tracks_to_remove:
             del self.tracked_objects[track_id]
 
-        # Fallback motion detection if YOLO didn't detect anything
-        # Uses background subtraction + optical flow + consistency checks
+        # Fallback object detection if YOLO didn't detect anything
+        # Detects NEW OBJECTS that appear in scene, not just background movement
         if not has_motion and self.enable_fallback and self.bg_subtractor is not None:
             # Skip fallback during background subtractor learning period
             if self.frame_count <= self.bg_learning_frames:
@@ -397,49 +410,87 @@ class MotionDetector:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
             # Apply background subtraction
-            fg_mask = self.bg_subtractor.apply(frame)
+            fg_mask = self.bg_subtractor.apply(frame, learningRate=0.001)  # Slow learning to adapt to moving plants
 
             # Apply ignore mask to remove timestamp/watermark regions
             if self.ignore_mask is not None:
                 fg_mask = cv2.bitwise_and(fg_mask, self.ignore_mask)
 
+            # Morphological operations to:
+            # 1. Remove noise and small scattered movements (plant leaves)
+            # 2. Enhance compact objects (animals)
+            kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+
+            # Remove small noise
+            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel_small)
+
+            # Close gaps in objects
+            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel_large)
+
             # Find contours in the foreground mask
             contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-            # Check if any significant motion detected via background subtraction
-            total_area = 0
+            # Analyze contours to find compact objects (animals) vs scattered patterns (plants)
+            valid_objects = []
+
             for contour in contours:
                 area = cv2.contourArea(contour)
-                if area > 100:  # Filter out very small movements
-                    total_area += area
 
-            # Validate motion with multiple checks
-            has_valid_motion = False
+                # Minimum size check - cats are at least 1200 pixels (e.g., 40x30)
+                if area < 1200:
+                    continue
 
-            if total_area > self.fallback_threshold:
-                # Check 1: Motion area consistency
-                # Real objects maintain consistent size; noise varies wildly
-                self.fallback_motion_areas.append(total_area)
-                if len(self.fallback_motion_areas) > 10:
-                    self.fallback_motion_areas.pop(0)
+                # Maximum size check - ignore huge areas (likely entire plant moving or lighting change)
+                if area > 50000:
+                    continue
 
-                area_consistency = True
-                if len(self.fallback_motion_areas) >= 3:
-                    # Check if areas are consistent (within 3x range)
-                    areas_array = np.array(self.fallback_motion_areas[-3:])
-                    area_ratio = np.max(areas_array) / (np.min(areas_array) + 1)
-                    if area_ratio > 5.0:  # Too much variation = likely noise
-                        area_consistency = False
+                # Get bounding rectangle
+                x, y, w, h = cv2.boundingRect(contour)
 
-                # Check 2: Optical flow validation
+                # Aspect ratio check - animals are roughly compact (not extremely elongated like branches)
+                aspect_ratio = max(w, h) / (min(w, h) + 1)
+                if aspect_ratio > 4.0:  # Too elongated = likely not an animal
+                    continue
+
+                # Calculate shape metrics to distinguish animals from plants
+                # 1. Extent: ratio of contour area to bounding box area
+                bbox_area = w * h
+                extent = area / bbox_area if bbox_area > 0 else 0
+
+                # 2. Solidity: ratio of contour area to convex hull area
+                hull = cv2.convexHull(contour)
+                hull_area = cv2.contourArea(hull)
+                solidity = area / hull_area if hull_area > 0 else 0
+
+                # Animals are relatively compact and solid
+                # extent: 0.4-0.9 (compact), plants are scattered: 0.1-0.3
+                # solidity: 0.7-0.95 (few indentations), plants have many gaps: 0.3-0.6
+                if extent > 0.35 and solidity > 0.65:
+                    # This looks like a compact object (potential animal)
+                    valid_objects.append({
+                        'contour': contour,
+                        'bbox': (x, y, w, h),
+                        'area': area,
+                        'extent': extent,
+                        'solidity': solidity,
+                        'aspect_ratio': aspect_ratio
+                    })
+
+            # If we found valid compact objects, check with optical flow
+            has_valid_object = False
+
+            if len(valid_objects) > 0:
+                # Check optical flow to confirm real motion (not just noise)
                 has_real_flow = False
+
                 if self.prev_frame_gray is not None:
-                    # Downsample frames for faster optical flow (1/4 resolution)
+                    # Downsample frames for faster optical flow
                     scale = 0.25
                     small_prev = cv2.resize(self.prev_frame_gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
                     small_gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
 
-                    # Calculate dense optical flow on downsampled frames
+                    # Calculate dense optical flow
                     flow = cv2.calcOpticalFlowFarneback(
                         small_prev, small_gray, None,
                         pyr_scale=0.5, levels=2, winsize=10,
@@ -449,49 +500,69 @@ class MotionDetector:
                     # Calculate magnitude of flow
                     mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
 
-                    # Look at 90th percentile flow instead of median (catches actual movement)
-                    percentile_flow = np.percentile(mag, 90) if mag.size > 0 else 0
+                    # Check if there's significant flow in the object regions
+                    for obj in valid_objects:
+                        x, y, w, h = obj['bbox']
+                        # Scale coordinates to match downsampled flow
+                        x_s, y_s = int(x * scale), int(y * scale)
+                        w_s, h_s = max(1, int(w * scale)), max(1, int(h * scale))
 
-                    # Real motion has peak flow above noise level
-                    # Slow-moving cats in IR produce flow 0.03-0.05
-                    # Noise/compression artifacts typically < 0.02
-                    if percentile_flow > 0.025:
-                        has_real_flow = True
+                        # Extract flow in object region
+                        if y_s + h_s <= mag.shape[0] and x_s + w_s <= mag.shape[1]:
+                            obj_flow = mag[y_s:y_s+h_s, x_s:x_s+w_s]
 
-                # Valid motion requires BOTH consistency AND optical flow
-                if area_consistency and (has_real_flow or self.prev_frame_gray is None):
-                    has_valid_motion = True
+                            # Check if object has meaningful motion
+                            # Use 75th percentile to detect actual movement
+                            if obj_flow.size > 0:
+                                flow_75 = np.percentile(obj_flow, 75)
+                                if flow_75 > 0.03:  # Threshold for real motion
+                                    has_real_flow = True
+                                    break
+                else:
+                    # First frame - accept without flow validation
+                    has_real_flow = True
 
-            # Increment or reset sustained motion counter
-            if has_valid_motion:
+                # Track area consistency for sustained detection
+                if has_real_flow:
+                    total_area = sum(obj['area'] for obj in valid_objects)
+                    self.fallback_motion_areas.append(total_area)
+                    if len(self.fallback_motion_areas) > 10:
+                        self.fallback_motion_areas.pop(0)
+
+                    # Check area consistency over time
+                    area_consistent = True
+                    if len(self.fallback_motion_areas) >= 3:
+                        areas_array = np.array(self.fallback_motion_areas[-3:])
+                        area_ratio = np.max(areas_array) / (np.min(areas_array) + 1)
+                        if area_ratio > 6.0:  # Too much variation
+                            area_consistent = False
+
+                    if area_consistent:
+                        has_valid_object = True
+
+            # Increment or reset sustained detection counter
+            if has_valid_object:
                 self.fallback_motion_frames += 1
             else:
                 self.fallback_motion_frames = 0
-                self.fallback_motion_areas.clear()  # Reset on false detection
+                self.fallback_motion_areas.clear()
 
-            # Trigger only after sustained motion over multiple frames
+            # Trigger only after sustained detection over multiple frames
             if self.fallback_motion_frames >= self.fallback_sustained_frames:
-                # Get bounding box of largest contour
-                if len(contours) > 0 and len(live_objects) == 0:
-                    largest_contour = max(contours, key=cv2.contourArea)
-                    x, y, w, h = cv2.boundingRect(largest_contour)
+                if len(valid_objects) > 0 and len(live_objects) == 0:
+                    # Use the largest valid object
+                    largest_obj = max(valid_objects, key=lambda o: o['area'])
+                    x, y, w, h = largest_obj['bbox']
 
-                    # Filter out tiny detections (noise/artifacts)
-                    # Real cats are at least 40x40 pixels minimum
-                    if w >= 40 and h >= 40:
-                        has_motion = True
-                        live_objects.append({
-                            'track_id': -1,  # Special ID for fallback
-                            'class': 'unknown',
-                            'confidence': 1.0,
-                            'bbox': np.array([x, y, x+w, y+h], dtype=np.float32),
-                            'size': (w, h),
-                            'area': w * h
-                        })
-                    else:
-                        # Too small - reset counter to avoid repeated small detections
-                        self.fallback_motion_frames = 0
-                        self.fallback_motion_areas.clear()
+                    has_motion = True
+                    live_objects.append({
+                        'track_id': -1,  # Special ID for fallback
+                        'class': 'unknown',
+                        'confidence': 1.0,
+                        'bbox': np.array([x, y, x+w, y+h], dtype=np.float32),
+                        'size': (w, h),
+                        'area': largest_obj['area']
+                    })
 
             # Store current frame for next iteration
             self.prev_frame_gray = gray
@@ -626,9 +697,9 @@ class MotionDetector:
                 ret, frame = self.cap.read()
 
                 if not ret:
-                    print("Failed to read frame, attempting to reconnect...")
+                    self.logger.warning("Failed to read frame, attempting to reconnect...")
                     self.cap.release()
-                    self.connect_stream()
+                    self.connect_stream(initial=False)
                     continue
 
                 # Validate frame to filter out RTSP/HEVC corruption
@@ -636,13 +707,13 @@ class MotionDetector:
                     self.corrupted_frames_count += 1
 
                     if self.corrupted_frames_count == 1:
-                        print(f"⚠️  Corrupted frame detected (HEVC/RTSP error) - skipping")
+                        self.logger.warning("Corrupted frame detected (HEVC/RTSP error) - skipping")
 
                     # Too many consecutive corrupted frames - reconnect
                     if self.corrupted_frames_count >= self.max_consecutive_corrupted:
-                        print(f"⚠️  Too many corrupted frames ({self.corrupted_frames_count}), reconnecting...")
+                        self.logger.warning(f"Too many corrupted frames ({self.corrupted_frames_count}), reconnecting...")
                         self.cap.release()
-                        self.connect_stream()
+                        self.connect_stream(initial=False)
                         self.corrupted_frames_count = 0
                         self.expected_frame_size = None  # Reset frame size
                     continue
@@ -650,11 +721,14 @@ class MotionDetector:
                 # Frame is valid - reset corruption counter
                 if self.corrupted_frames_count > 0:
                     if self.corrupted_frames_count > 1:
-                        print(f"✓ Stream recovered (skipped {self.corrupted_frames_count} corrupted frames)")
+                        self.logger.info(f"Stream recovered (skipped {self.corrupted_frames_count} corrupted frames)")
                     self.corrupted_frames_count = 0
 
                 # Detect motion and classify objects
                 has_motion, live_objects = self.detect_motion_and_classify(frame)
+
+                # Create annotated frame with detection overlays for recording and display
+                annotated_frame = self.draw_detections(frame, live_objects if has_motion else [])
 
                 # Motion detection should only trigger recordings if not in manual recording mode
                 if has_motion and len(live_objects) > 0 and not self.manual_recording:
@@ -663,7 +737,7 @@ class MotionDetector:
                     # Start recording if not already recording
                     if not self.recording:
                         self.play_alert()
-                        self.start_recording(frame, manual=False)
+                        self.start_recording(annotated_frame, manual=False)
 
                         # Print detection info
                         print(f"⚠️  LIVE OBJECT DETECTED!")
@@ -691,9 +765,9 @@ class MotionDetector:
                                 print(f"   {i}. {obj['class'].upper()} {confidence_indicator}")
                                 print(f"      Confidence: {obj['confidence']:.1%} | Size: {width}x{height}px | ID: {obj['track_id']}")
 
-                    # Record frame
+                    # Record annotated frame
                     if self.recording and self.video_writer:
-                        self.video_writer.write(frame)
+                        self.video_writer.write(annotated_frame)
                 else:
                     # No motion detected
                     self.frames_without_motion += 1
@@ -702,17 +776,17 @@ class MotionDetector:
                     if self.recording and not self.manual_recording:
                         if self.frames_without_motion < self.motion_cooldown:
                             if self.video_writer:
-                                self.video_writer.write(frame)
+                                self.video_writer.write(annotated_frame)
                         else:
                             self.stop_recording()
 
                 # Always record if in manual recording mode
                 if self.manual_recording and self.recording and self.video_writer:
-                    self.video_writer.write(frame)
+                    self.video_writer.write(annotated_frame)
 
                 # Display frame
                 if self.display:
-                    display_frame = self.draw_detections(frame, live_objects if has_motion else [])
+                    display_frame = annotated_frame
 
                     # Resize display window to 33% for smaller preview
                     display_height, display_width = display_frame.shape[:2]
