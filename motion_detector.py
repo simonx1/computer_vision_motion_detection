@@ -8,7 +8,7 @@ Uses YOLO object tracking (ByteTrack) for motion detection.
 import argparse
 import cv2
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import os
 import platform
@@ -16,6 +16,7 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 from dotenv import load_dotenv
 from ultralytics import YOLO
+import zoneinfo
 
 # Load environment variables from .env file
 load_dotenv()
@@ -26,7 +27,7 @@ class MotionDetector:
                  motion_threshold=75, sustained_frames=3,
                  output_dir="recordings", display=True,
                  enable_fallback=True, fallback_threshold=300,
-                 ignore_regions=None):
+                 ignore_regions=None, timezone_str='Europe/Berlin'):
         """
         Initialize the motion detector with YOLO tracking.
 
@@ -41,6 +42,7 @@ class MotionDetector:
             enable_fallback: Enable fallback motion detection when YOLO fails
             fallback_threshold: Minimum pixel area for fallback motion detection
             ignore_regions: List of regions to ignore for motion detection (x1,y1,x2,y2)
+            timezone_str: Timezone for timestamps (e.g., 'Europe/Berlin' for CET)
         """
         self.rtsp_url = rtsp_url
         self.model_size = model_size
@@ -53,6 +55,15 @@ class MotionDetector:
         self.fallback_threshold = fallback_threshold
         self.ignore_regions = ignore_regions or []
         self.ignore_mask = None  # Will be created when we get first frame
+
+        # Setup timezone
+        try:
+            self.timezone = zoneinfo.ZoneInfo(timezone_str)
+            self.timezone_str = timezone_str
+        except Exception as e:
+            print(f"Warning: Invalid timezone '{timezone_str}', falling back to UTC. Error: {e}")
+            self.timezone = zoneinfo.ZoneInfo('UTC')
+            self.timezone_str = 'UTC'
 
         # Create output directory
         self.output_dir.mkdir(exist_ok=True)
@@ -110,6 +121,7 @@ class MotionDetector:
         }
 
         print(f"Live object classes: {', '.join(sorted(self.live_object_classes))}")
+        print(f"Timezone: {self.timezone_str}")
 
         # Initialize YOLO model with tracking
         print(f"Loading YOLOv8-{model_size} model...")
@@ -571,7 +583,7 @@ class MotionDetector:
 
     def start_recording(self, frame, manual=False):
         """Start recording video"""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(self.timezone).strftime("%Y%m%d_%H%M%S")
         prefix = "manual" if manual else "motion"
         filename = self.output_dir / f"{prefix}_{timestamp}.mp4"
 
@@ -627,7 +639,7 @@ class MotionDetector:
 
     def save_screenshot(self, frame):
         """Save a screenshot of the current frame"""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(self.timezone).strftime("%Y%m%d_%H%M%S")
         filename = self.screenshots_dir / f"screenshot_{timestamp}.jpg"
 
         # Save as JPEG with high quality
@@ -669,8 +681,8 @@ class MotionDetector:
                 cv2.putText(display_frame, "REC", (50, 35),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-        # Add timestamp
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Add timestamp with timezone
+        timestamp = datetime.now(self.timezone).strftime("%Y-%m-%d %H:%M:%S")
         cv2.putText(display_frame, timestamp, (10, frame.shape[0] - 10),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
@@ -945,6 +957,15 @@ Examples:
              'Example: --ignore-region 0,0.9,0.3,1.0 (bottom-left 30%% of frame)'
     )
 
+    parser.add_argument(
+        '--timezone',
+        type=str,
+        default=os.getenv('TIMEZONE', 'Europe/Berlin'),
+        help='Timezone for timestamps in filenames and overlays (default: Europe/Berlin for CET). '
+             'Use IANA timezone names (e.g., Europe/Berlin, America/New_York, UTC). '
+             'Can also be set via TIMEZONE environment variable.'
+    )
+
     args = parser.parse_args()
 
     # Parse ignore regions - check environment first, then CLI args
@@ -992,7 +1013,8 @@ Examples:
         display=not args.no_display,
         enable_fallback=args.enable_fallback,
         fallback_threshold=args.fallback_threshold,
-        ignore_regions=ignore_regions
+        ignore_regions=ignore_regions,
+        timezone_str=args.timezone
     )
 
     detector.run()
