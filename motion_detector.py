@@ -101,16 +101,21 @@ class MotionDetector:
         self.bg_subtractor = None
         self.prev_frame_gray = None  # For optical flow
         self.fallback_motion_frames = 0  # Track consecutive frames with fallback motion
-        self.fallback_sustained_frames = 5  # Require 5 frames of motion before triggering (increased)
+        self.fallback_sustained_frames = 7  # Require 7 frames of motion before triggering (increased)
         self.fallback_motion_areas = []  # Track motion area sizes for consistency check
-        self.bg_learning_frames = 100  # Skip fallback for first 100 frames (longer bg learning)
+        self.bg_learning_frames = 200  # Skip fallback for first 200 frames (even longer bg learning)
         self.stable_background_mask = None  # Mask of regions that are part of stable background
         self.background_update_counter = 0  # Counter for background stability tracking
 
+        # Track fallback detected objects to filter out static objects
+        self.fallback_tracked_objects = {}  # {obj_id: {'center': (x,y), 'positions': [], 'first_seen': frame, 'area': int}}
+        self.fallback_object_id_counter = 0
+        self.static_object_threshold_frames = 50  # If object doesn't move for 50 frames, it's static
+
         if self.enable_fallback:
             self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-                history=1000,  # Longer history to better adapt to moving plants
-                varThreshold=50,  # Higher threshold to ignore subtle plant motion
+                history=1500,  # Even longer history to better adapt to moving plants/shadows
+                varThreshold=60,  # Higher threshold to ignore subtle plant/shadow motion
                 detectShadows=False
             )
 
@@ -489,68 +494,142 @@ class MotionDetector:
                         'aspect_ratio': aspect_ratio
                     })
 
-            # If we found valid compact objects, check with optical flow
+            # If we found valid compact objects, filter static objects and check motion
             has_valid_object = False
+            moving_objects = []
 
             if len(valid_objects) > 0:
-                # Check optical flow to confirm real motion (not just noise)
-                has_real_flow = False
+                # Match detected objects with tracked objects
+                for obj in valid_objects:
+                    x, y, w, h = obj['bbox']
+                    center = (x + w // 2, y + h // 2)
 
-                if self.prev_frame_gray is not None:
-                    # Downsample frames for faster optical flow
-                    scale = 0.25
-                    small_prev = cv2.resize(self.prev_frame_gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
-                    small_gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+                    # Find matching tracked object (within 50 pixels)
+                    matched_id = None
+                    min_dist = 50
+                    for obj_id, tracked in self.fallback_tracked_objects.items():
+                        tx, ty = tracked['center']
+                        dist = np.sqrt((center[0] - tx) ** 2 + (center[1] - ty) ** 2)
+                        if dist < min_dist:
+                            min_dist = dist
+                            matched_id = obj_id
 
-                    # Calculate dense optical flow
-                    flow = cv2.calcOpticalFlowFarneback(
-                        small_prev, small_gray, None,
-                        pyr_scale=0.5, levels=2, winsize=10,
-                        iterations=2, poly_n=5, poly_sigma=1.1, flags=0
-                    )
+                    if matched_id is not None:
+                        # Update existing tracked object
+                        tracked = self.fallback_tracked_objects[matched_id]
+                        tracked['positions'].append(center)
+                        if len(tracked['positions']) > 20:  # Keep last 20 positions
+                            tracked['positions'].pop(0)
+                        tracked['center'] = center
+                        tracked['last_seen'] = self.frame_count
 
-                    # Calculate magnitude of flow
-                    mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+                        # Check if object has moved significantly
+                        frames_tracked = self.frame_count - tracked['first_seen']
+                        if frames_tracked >= 20 and len(tracked['positions']) >= 20:
+                            # Calculate total displacement over last 20 frames
+                            first_pos = tracked['positions'][0]
+                            last_pos = tracked['positions'][-1]
+                            total_displacement = np.sqrt(
+                                (last_pos[0] - first_pos[0]) ** 2 +
+                                (last_pos[1] - first_pos[1]) ** 2
+                            )
 
-                    # Check if there's significant flow in the object regions
-                    for obj in valid_objects:
-                        x, y, w, h = obj['bbox']
-                        # Scale coordinates to match downsampled flow
-                        x_s, y_s = int(x * scale), int(y * scale)
-                        w_s, h_s = max(1, int(w * scale)), max(1, int(h * scale))
+                            # If displacement is less than 30 pixels over 20 frames, it's static
+                            if total_displacement < 30:
+                                # Mark as static object - skip it
+                                continue
+                            else:
+                                # Object is moving
+                                obj['obj_id'] = matched_id
+                                moving_objects.append(obj)
+                        else:
+                            # Not enough tracking data yet
+                            obj['obj_id'] = matched_id
+                            moving_objects.append(obj)
+                    else:
+                        # New object - create tracking entry
+                        new_id = self.fallback_object_id_counter
+                        self.fallback_object_id_counter += 1
 
-                        # Extract flow in object region
-                        if y_s + h_s <= mag.shape[0] and x_s + w_s <= mag.shape[1]:
-                            obj_flow = mag[y_s:y_s+h_s, x_s:x_s+w_s]
+                        self.fallback_tracked_objects[new_id] = {
+                            'center': center,
+                            'positions': [center],
+                            'first_seen': self.frame_count,
+                            'last_seen': self.frame_count,
+                            'area': obj['area']
+                        }
 
-                            # Check if object has meaningful motion
-                            # Use 75th percentile to detect actual movement
-                            if obj_flow.size > 0:
-                                flow_75 = np.percentile(obj_flow, 75)
-                                if flow_75 > 0.03:  # Threshold for real motion
-                                    has_real_flow = True
-                                    break
-                else:
-                    # First frame - accept without flow validation
-                    has_real_flow = True
+                        obj['obj_id'] = new_id
+                        moving_objects.append(obj)
 
-                # Track area consistency for sustained detection
-                if has_real_flow:
-                    total_area = sum(obj['area'] for obj in valid_objects)
-                    self.fallback_motion_areas.append(total_area)
-                    if len(self.fallback_motion_areas) > 10:
-                        self.fallback_motion_areas.pop(0)
+                # Clean up old tracked objects (not seen for 100 frames)
+                objects_to_remove = []
+                for obj_id, tracked in self.fallback_tracked_objects.items():
+                    if self.frame_count - tracked['last_seen'] > 100:
+                        objects_to_remove.append(obj_id)
+                for obj_id in objects_to_remove:
+                    del self.fallback_tracked_objects[obj_id]
 
-                    # Check area consistency over time
-                    area_consistent = True
-                    if len(self.fallback_motion_areas) >= 3:
-                        areas_array = np.array(self.fallback_motion_areas[-3:])
-                        area_ratio = np.max(areas_array) / (np.min(areas_array) + 1)
-                        if area_ratio > 6.0:  # Too much variation
-                            area_consistent = False
+                # Now check optical flow only for moving objects
+                if len(moving_objects) > 0:
+                    has_real_flow = False
 
-                    if area_consistent:
-                        has_valid_object = True
+                    if self.prev_frame_gray is not None:
+                        # Downsample frames for faster optical flow
+                        scale = 0.25
+                        small_prev = cv2.resize(self.prev_frame_gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+                        small_gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+
+                        # Calculate dense optical flow
+                        flow = cv2.calcOpticalFlowFarneback(
+                            small_prev, small_gray, None,
+                            pyr_scale=0.5, levels=2, winsize=10,
+                            iterations=2, poly_n=5, poly_sigma=1.1, flags=0
+                        )
+
+                        # Calculate magnitude of flow
+                        mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+
+                        # Check if there's significant flow in the moving object regions
+                        for obj in moving_objects:
+                            x, y, w, h = obj['bbox']
+                            # Scale coordinates to match downsampled flow
+                            x_s, y_s = int(x * scale), int(y * scale)
+                            w_s, h_s = max(1, int(w * scale)), max(1, int(h * scale))
+
+                            # Extract flow in object region
+                            if y_s + h_s <= mag.shape[0] and x_s + w_s <= mag.shape[1]:
+                                obj_flow = mag[y_s:y_s+h_s, x_s:x_s+w_s]
+
+                                # Check if object has meaningful motion
+                                # Use 75th percentile to detect actual movement
+                                if obj_flow.size > 0:
+                                    flow_75 = np.percentile(obj_flow, 75)
+                                    if flow_75 > 0.05:  # Increased threshold to 0.05
+                                        has_real_flow = True
+                                        break
+                    else:
+                        # First frame - don't trigger
+                        has_real_flow = False
+
+                    # Track area consistency for sustained detection
+                    if has_real_flow:
+                        total_area = sum(obj['area'] for obj in moving_objects)
+                        self.fallback_motion_areas.append(total_area)
+                        if len(self.fallback_motion_areas) > 10:
+                            self.fallback_motion_areas.pop(0)
+
+                        # Check area consistency over time
+                        area_consistent = True
+                        if len(self.fallback_motion_areas) >= 5:  # Increased to 5 samples
+                            areas_array = np.array(self.fallback_motion_areas[-5:])
+                            area_ratio = np.max(areas_array) / (np.min(areas_array) + 1)
+                            if area_ratio > 4.0:  # Reduced variation tolerance
+                                area_consistent = False
+
+                        if area_consistent:
+                            has_valid_object = True
+                            valid_objects = moving_objects  # Use only moving objects
 
             # Increment or reset sustained detection counter
             if has_valid_object:
