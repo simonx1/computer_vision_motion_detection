@@ -17,6 +17,7 @@ from logging.handlers import TimedRotatingFileHandler
 from dotenv import load_dotenv
 from ultralytics import YOLO
 import zoneinfo
+import time
 
 # Load environment variables from .env file
 load_dotenv()
@@ -96,6 +97,15 @@ class MotionDetector:
         self.corrupted_frames_count = 0
         self.max_consecutive_corrupted = 10  # Reconnect after 10 consecutive bad frames
         self.frame_size_initialized = False  # Track if we've shown frame size info
+
+        # Connection stability tracking (configurable via .env)
+        self.connection_retry_count = 0
+        self.max_retry_attempts = int(os.getenv('MAX_RETRY_ATTEMPTS', '10'))
+        self.base_retry_delay = int(os.getenv('BASE_RETRY_DELAY', '2'))
+        self.last_successful_frame_time = None
+        self.connection_timeout_seconds = int(os.getenv('CONNECTION_TIMEOUT', '60'))
+        self.failed_reads_count = 0
+        self.max_failed_reads = int(os.getenv('MAX_FAILED_READS', '5'))
 
         # Fallback motion detection (background subtraction + optical flow)
         self.bg_subtractor = None
@@ -194,9 +204,18 @@ class MotionDetector:
             print('\a', flush=True)
 
     def connect_stream(self, initial=True):
-        """Connect to RTSP stream with optimized settings"""
+        """
+        Connect to RTSP stream with robust retry mechanism and exponential backoff.
+
+        Args:
+            initial: If True, this is the first connection attempt
+
+        Returns:
+            bool: True if connection successful, False otherwise
+        """
         if initial:
             print(f"Connecting to RTSP stream: {self.rtsp_url}")
+            self.connection_retry_count = 0
         else:
             self.logger.info("Reconnecting to RTSP stream...")
 
@@ -204,32 +223,92 @@ class MotionDetector:
         rtsp_transport = os.getenv('RTSP_TRANSPORT', 'tcp').lower()
         buffer_size = int(os.getenv('BUFFER_SIZE', '5'))
 
-        # Set RTSP transport protocol (tcp = reliable, udp = low latency)
-        # TCP prevents UDP packet loss which causes HEVC "Could not find ref" errors
-        os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = f'rtsp_transport;{rtsp_transport}'
+        # Retry loop with exponential backoff
+        while self.connection_retry_count < self.max_retry_attempts:
+            try:
+                # Calculate delay with exponential backoff
+                if self.connection_retry_count > 0:
+                    delay = min(self.base_retry_delay * (2 ** (self.connection_retry_count - 1)), 60)
+                    retry_msg = f"Retry attempt {self.connection_retry_count}/{self.max_retry_attempts} after {delay}s delay..."
+                    if initial:
+                        print(retry_msg)
+                    else:
+                        self.logger.info(retry_msg)
+                    time.sleep(delay)
 
-        # Use FFmpeg backend for better RTSP handling
-        self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+                # Release previous connection if exists
+                if self.cap is not None:
+                    try:
+                        self.cap.release()
+                    except:
+                        pass
+                    self.cap = None
+                    # Give the camera time to reset
+                    time.sleep(1)
 
-        # Configure RTSP timeouts
-        self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)  # 5 second connection timeout
-        self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)  # 5 second read timeout
+                # Set RTSP transport protocol (tcp = reliable, udp = low latency)
+                # TCP prevents UDP packet loss which causes HEVC "Could not find ref" errors
+                os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = f'rtsp_transport;{rtsp_transport}'
 
-        if not self.cap.isOpened():
-            raise ConnectionError(f"Failed to connect to RTSP stream: {self.rtsp_url}")
+                # Use FFmpeg backend for better RTSP handling
+                self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
 
-        # Set buffer size to balance latency vs reliability
-        # Larger buffer = fewer dropped frames (less HEVC errors) but more latency
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, buffer_size)
+                # Configure RTSP timeouts - longer for initial connection
+                connection_timeout = 15000 if initial else 10000  # 15s initial, 10s reconnect
+                read_timeout = 10000  # 10 second read timeout
 
-        if initial:
-            print("Successfully connected to stream")
-            print(f"Transport: {rtsp_transport.upper()}")
-            print(f"Buffer size: {buffer_size} frames")
-            print(f"Frame size: {int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
-            print(f"FPS: {self.cap.get(cv2.CAP_PROP_FPS)}")
-        else:
-            self.logger.info(f"Reconnected successfully | Transport: {rtsp_transport.upper()} | Buffer: {buffer_size}")
+                self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, connection_timeout)
+                self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, read_timeout)
+
+                # Check if connection opened
+                if not self.cap.isOpened():
+                    raise ConnectionError("VideoCapture failed to open stream")
+
+                # Set buffer size to balance latency vs reliability
+                # Larger buffer = fewer dropped frames (less HEVC errors) but more latency
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, buffer_size)
+
+                # Verify connection by reading a test frame
+                ret, test_frame = self.cap.read()
+                if not ret or test_frame is None:
+                    raise ConnectionError("Failed to read test frame from stream")
+
+                # Connection successful
+                if initial:
+                    print("Successfully connected to stream")
+                    print(f"Transport: {rtsp_transport.upper()}")
+                    print(f"Buffer size: {buffer_size} frames")
+                    print(f"Frame size: {int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
+                    print(f"FPS: {self.cap.get(cv2.CAP_PROP_FPS)}")
+                else:
+                    self.logger.info(f"Reconnected successfully | Transport: {rtsp_transport.upper()} | Buffer: {buffer_size}")
+
+                # Reset retry counter and connection health tracking
+                self.connection_retry_count = 0
+                self.failed_reads_count = 0
+                self.last_successful_frame_time = time.time()
+
+                return True
+
+            except Exception as e:
+                self.connection_retry_count += 1
+                error_msg = f"Connection attempt {self.connection_retry_count} failed: {str(e)}"
+
+                if self.connection_retry_count < self.max_retry_attempts:
+                    if initial:
+                        print(error_msg)
+                    else:
+                        self.logger.warning(error_msg)
+                else:
+                    # Max retries reached
+                    final_error = f"Failed to connect after {self.max_retry_attempts} attempts"
+                    if initial:
+                        print(f"\n{final_error}")
+                    else:
+                        self.logger.error(final_error)
+                    raise ConnectionError(f"Failed to connect to RTSP stream: {self.rtsp_url}")
+
+        return False
 
     def create_ignore_mask(self, frame_shape):
         """Create a mask for ignore regions (e.g., timestamp areas)"""
@@ -785,13 +864,49 @@ class MotionDetector:
             print("="*60 + "\n")
 
             while True:
+                # Check connection health - reconnect if no frames for too long
+                if self.last_successful_frame_time is not None:
+                    time_since_last_frame = time.time() - self.last_successful_frame_time
+                    if time_since_last_frame > self.connection_timeout_seconds:
+                        self.logger.warning(f"No frames received for {time_since_last_frame:.1f}s, reconnecting...")
+                        self.cap.release()
+                        self.connect_stream(initial=False)
+                        continue
+
+                # Read frame with error handling
                 ret, frame = self.cap.read()
 
-                if not ret:
-                    self.logger.warning("Failed to read frame, attempting to reconnect...")
-                    self.cap.release()
-                    self.connect_stream(initial=False)
+                if not ret or frame is None:
+                    self.failed_reads_count += 1
+
+                    if self.failed_reads_count == 1:
+                        self.logger.warning("Failed to read frame")
+
+                    # Too many consecutive failed reads - reconnect
+                    if self.failed_reads_count >= self.max_failed_reads:
+                        self.logger.warning(f"Too many failed reads ({self.failed_reads_count}), attempting to reconnect...")
+                        self.cap.release()
+                        self.failed_reads_count = 0
+
+                        # Try to reconnect
+                        try:
+                            self.connect_stream(initial=False)
+                        except ConnectionError as e:
+                            self.logger.error(f"Reconnection failed: {e}")
+                            # Wait before next retry
+                            time.sleep(5)
+                        continue
+
+                    # Wait a bit before retry
+                    time.sleep(0.5)
                     continue
+
+                # Frame read successful - reset counter and update timestamp
+                if self.failed_reads_count > 0:
+                    self.logger.info(f"Stream recovered (after {self.failed_reads_count} failed reads)")
+                    self.failed_reads_count = 0
+
+                self.last_successful_frame_time = time.time()
 
                 # Validate frame to filter out RTSP/HEVC corruption
                 if not self.is_frame_valid(frame):
